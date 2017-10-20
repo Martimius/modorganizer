@@ -60,16 +60,14 @@ ModList::ModList(QObject *parent)
   , m_FontMetrics(QFont())
   , m_DropOnItems(false)
 {
-  m_ContentIcons[ModInfo::CONTENT_PLUGIN]    = std::make_tuple(":/MO/gui/content/plugin", tr("Game plugins (esp/esm)"));
+  m_ContentIcons[ModInfo::CONTENT_PLUGIN]    = std::make_tuple(":/MO/gui/content/plugin", tr("Game plugins (esl/esp/esm)"));
   m_ContentIcons[ModInfo::CONTENT_INTERFACE] = std::make_tuple(":/MO/gui/content/interface", tr("Interface"));
   m_ContentIcons[ModInfo::CONTENT_MESH]      = std::make_tuple(":/MO/gui/content/mesh", tr("Meshes"));
   m_ContentIcons[ModInfo::CONTENT_BSA]       = std::make_tuple(":/MO/gui/content/bsa", tr("BSA"));
-  m_ContentIcons[ModInfo::CONTENT_MUSIC]     = std::make_tuple(":/MO/gui/content/music", tr("Music"));
   m_ContentIcons[ModInfo::CONTENT_SCRIPT]    = std::make_tuple(":/MO/gui/content/script", tr("Scripts (Papyrus)"));
   m_ContentIcons[ModInfo::CONTENT_SKSE]      = std::make_tuple(":/MO/gui/content/skse", tr("Script Extender Plugin"));
   m_ContentIcons[ModInfo::CONTENT_SKYPROC]   = std::make_tuple(":/MO/gui/content/skyproc", tr("SkyProc Patcher"));
-  m_ContentIcons[ModInfo::CONTENT_SOUND]     = std::make_tuple(":/MO/gui/content/sound", tr("Sound"));
-  m_ContentIcons[ModInfo::CONTENT_STRING]    = std::make_tuple(":/MO/gui/content/string", tr("Strings"));
+  m_ContentIcons[ModInfo::CONTENT_SOUND]     = std::make_tuple(":/MO/gui/content/sound", tr("Sound or Music"));
   m_ContentIcons[ModInfo::CONTENT_TEXTURE]   = std::make_tuple(":/MO/gui/content/texture", tr("Textures"));
 
   m_LastCheck.start();
@@ -1028,7 +1026,7 @@ QString ModList::getColumnToolTip(int column)
     case COL_FLAGS:    return tr("Emblemes to highlight things that might require attention.");
     case COL_CONTENT:  return tr("Depicts the content of the mod:<br>"
                                  "<table cellspacing=7>"
-                                 "<tr><td><img src=\":/MO/gui/content/plugin\" width=32/></td><td>Game plugins (esp/esm)</tr>"
+                                 "<tr><td><img src=\":/MO/gui/content/plugin\" width=32/></td><td>Game plugins (esl/esp/esm)</tr>"
                                  "<tr><td><img src=\":/MO/gui/content/interface\" width=32/></td><td>Interface</tr>"
                                  "<tr><td><img src=\":/MO/gui/content/mesh\" width=32/></td><td>Meshes</tr>"
                                  "<tr><td><img src=\":/MO/gui/content/bsa\" width=32/></td><td>BSA</tr>"

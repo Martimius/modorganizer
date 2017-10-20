@@ -89,7 +89,8 @@ ModInfoDialog::ModInfoDialog(ModInfo::Ptr modInfo, const DirectoryEntry *directo
   connect(this, SIGNAL(thumbnailClickedSignal(const QString&)), this, SLOT(thumbnailClicked(const QString&)));
   connect(m_ModInfo.data(), SIGNAL(modDetailsUpdated(bool)), this, SLOT(modDetailsUpdated(bool)));
   connect(ui->descriptionView, SIGNAL(linkClicked(QUrl)), this, SLOT(linkClicked(QUrl)));
-  ui->descriptionView->page()->setLinkDelegationPolicy(QWebPage::DelegateAllLinks);
+  //TODO: No easy way to delegate links
+  //ui->descriptionView->page()->acceptNavigationRequest(QWebEnginePage::DelegateAllLinks);
 
   if (directory->originExists(ToWString(modInfo->name()))) {
     m_Origin = &directory->getOriginByName(ToWString(modInfo->name()));
@@ -313,7 +314,8 @@ void ModInfoDialog::refreshLists()
           ui->iniFileList->addItem(namePart);
         }
       } else if (fileName.endsWith(".esp", Qt::CaseInsensitive) ||
-                 fileName.endsWith(".esm", Qt::CaseInsensitive)) {
+                 fileName.endsWith(".esl", Qt::CaseInsensitive) || 
+				 fileName.endsWith(".esm", Qt::CaseInsensitive)) {
         QString relativePath = fileName.mid(m_RootPath.length() + 1);
         if (relativePath.contains('/')) {
           QFileInfo fileInfo(fileName);
@@ -351,14 +353,18 @@ void ModInfoDialog::refreshLists()
 
 void ModInfoDialog::addCategories(const CategoryFactory &factory, const std::set<int> &enabledCategories, QTreeWidgetItem *root, int rootLevel)
 {
-  for (size_t i = 0; i < factory.numCategories(); ++i) {
+  for (int i = 0; i < static_cast<int>(factory.numCategories()); ++i) {
     if (factory.getParentID(i) != rootLevel) {
       continue;
     }
     int categoryID = factory.getCategoryID(i);
-    QTreeWidgetItem *newItem = new QTreeWidgetItem(QStringList(factory.getCategoryName(i)));
+    QTreeWidgetItem *newItem
+        = new QTreeWidgetItem(QStringList(factory.getCategoryName(i)));
     newItem->setFlags(newItem->flags() | Qt::ItemIsUserCheckable);
-    newItem->setCheckState(0, enabledCategories.find(categoryID) != enabledCategories.end() ? Qt::Checked : Qt::Unchecked);
+    newItem->setCheckState(0, enabledCategories.find(categoryID)
+                                      != enabledCategories.end()
+                                  ? Qt::Checked
+                                  : Qt::Unchecked);
     newItem->setData(0, Qt::UserRole, categoryID);
     if (factory.hasChildren(i)) {
       addCategories(factory, enabledCategories, newItem, categoryID);

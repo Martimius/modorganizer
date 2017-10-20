@@ -18,9 +18,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "pluginlist.h"
-#include "inject.h"
 #include "settings.h"
-#include "safewritefile.h"
 #include "scopeguard.h"
 #include "modinfo.h"
 #include <utility.h>
@@ -28,6 +26,8 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <espfile.h>
 #include <report.h>
 #include <windows_error.h>
+#include <safewritefile.h>
+#include <gameplugins.h>
 
 #include <QtDebug>
 #include <QMessageBox>
@@ -75,14 +75,6 @@ PluginList::PluginList(QObject *parent)
   : QAbstractItemModel(parent)
   , m_FontMetrics(QFont())
 {
-  m_Utf8Codec = QTextCodec::codecForName("utf-8");
-  m_LocalCodec = QTextCodec::codecForName("Windows-1252");
-
-  if (m_LocalCodec == nullptr) {
-    qCritical("required 8-bit string-encoding not supported.");
-    m_LocalCodec = m_Utf8Codec;
-  }
-
 }
 
 PluginList::~PluginList()
@@ -118,30 +110,32 @@ QString PluginList::getColumnToolTip(int column)
 
 void PluginList::refresh(const QString &profileName
                          , const DirectoryEntry &baseDirectory
-                         , const QString &pluginsFile
-                         , const QString &loadOrderFile
                          , const QString &lockedOrderFile)
 {
   ChangeBracket<PluginList> layoutChange(this);
-
-  m_ESPsByName.clear();
-  m_ESPsByPriority.clear();
-  m_ESPs.clear();
 
   QStringList primaryPlugins = m_GamePlugin->primaryPlugins();
 
   m_CurrentProfile = profileName;
 
+  QStringList availablePlugins;
+
   std::vector<FileEntry::Ptr> files = baseDirectory.getFiles();
-  for (auto iter = files.begin(); iter != files.end(); ++iter) {
-    FileEntry::Ptr current = *iter;
+  for (FileEntry::Ptr current : files) {
     if (current.get() == nullptr) {
       continue;
     }
     QString filename = ToQString(current->getName());
+
+    availablePlugins.append(filename.toLower());
+
+    if (m_ESPsByName.find(filename.toLower()) != m_ESPsByName.end()) {
+      continue;
+    }
+
     QString extension = filename.right(3).toLower();
 
-    if ((extension == "esp") || (extension == "esm")) {
+    if ((extension == "esl") || (extension == "esp") || (extension == "esm")) {
       bool forceEnabled = Settings::instance().forceEnableCoreFiles() &&
                             std::find(primaryPlugins.begin(), primaryPlugins.end(), filename.toLower()) != primaryPlugins.end();
 
@@ -160,73 +154,78 @@ void PluginList::refresh(const QString &profileName
         }
 
         m_ESPs.push_back(ESPInfo(filename, forceEnabled, originName, ToQString(current->getFullPath()), hasIni));
+        m_ESPs.rbegin()->m_Priority = -1;
       } catch (const std::exception &e) {
         reportError(tr("failed to update esp info for file %1 (source id: %2), error: %3").arg(filename).arg(current->getOrigin(archive)).arg(e.what()));
       }
     }
   }
 
-  if (readLoadOrder(loadOrderFile)) {
-    int maxPriority = 0;
-    // assign known load orders
-    for (std::vector<ESPInfo>::iterator espIter = m_ESPs.begin(); espIter != m_ESPs.end(); ++espIter) {
-      std::map<QString, int>::const_iterator priorityIter = m_ESPLoadOrder.find(espIter->m_Name.toLower());
-      if (priorityIter != m_ESPLoadOrder.end()) {
-        if (priorityIter->second > maxPriority) {
-          maxPriority = priorityIter->second;
-        }
-        espIter->m_Priority = priorityIter->second;
-      } else {
-        espIter->m_Priority = -1;
-      }
-    }
-
-    ++maxPriority;
-
-    // assign maximum priorities for plugins with unknown priority
-    for (std::vector<ESPInfo>::iterator espIter = m_ESPs.begin(); espIter != m_ESPs.end(); ++espIter) {
-      if (espIter->m_Priority == -1) {
-        espIter->m_Priority = maxPriority++;
-      }
-    }
-  } else {
-    // no load order stored, determine by date
-    std::sort(m_ESPs.begin(), m_ESPs.end(), ByDate);
-
-    for (size_t i = 0; i < m_ESPs.size(); ++i) {
-      m_ESPs[i].m_Priority = i;
+  for (const auto &espName : m_ESPsByName) {
+    if (!availablePlugins.contains(espName.first)) {
+      m_ESPs[espName.second].m_Name = "";
     }
   }
 
-  std::sort(m_ESPs.begin(), m_ESPs.end(), ByPriority); // first, sort by priority
-  // remove gaps from the priorities so we can use them as array indices without overflow
-  for (int i = 0; i < static_cast<int>(m_ESPs.size()); ++i) {
-    m_ESPs[i].m_Priority = i;
-  }
+  m_ESPs.erase(std::remove_if(m_ESPs.begin(), m_ESPs.end(),
+                              [](const ESPInfo &info) -> bool {
+                                return info.m_Name.isEmpty();
+                              }),
+               m_ESPs.end());
 
-  std::sort(m_ESPs.begin(), m_ESPs.end(), ByName); // sort by name so alphabetical sorting works
+  fixPriorities();
 
+  // functions in GamePlugins will use the IPluginList interface of this, so
+  // indices need to work. priority will be off however
   updateIndices();
 
-  readEnabledFrom(pluginsFile);
+  GamePlugins *gamePlugins = m_GamePlugin->feature<GamePlugins>();
+  gamePlugins->readPluginLists(this);
+
+  testMasters();
+
+  updateIndices();
 
   readLockedOrderFrom(lockedOrderFile);
 
   layoutChange.finish();
 
   refreshLoadOrder();
-  emit dataChanged(this->index(0, 0), this->index(m_ESPs.size(), columnCount()));
+  emit dataChanged(this->index(0, 0),
+                   this->index(static_cast<int>(m_ESPs.size()), columnCount()));
 
   m_Refreshed();
 }
 
+void PluginList::fixPriorities()
+{
+  std::vector<std::pair<int, int>> espPrios;
+
+  for (int i = 0; i < m_ESPs.size(); ++i) {
+    int prio = m_ESPs[i].m_Priority;
+    if (prio == -1) {
+      prio = INT_MAX;
+    }
+    espPrios.push_back(std::make_pair(prio, i));
+  }
+
+  std::sort(espPrios.begin(), espPrios.end(),
+            [](const std::pair<int, int> &lhs, const std::pair<int, int> &rhs) {
+              return lhs.first < rhs.first;
+            });
+
+  for (int i = 0; i < espPrios.size(); ++i) {
+    m_ESPs[espPrios[i].second].m_Priority = i;
+  }
+}
 
 void PluginList::enableESP(const QString &name, bool enable)
 {
   std::map<QString, int>::iterator iter = m_ESPsByName.find(name.toLower());
 
   if (iter != m_ESPsByName.end()) {
-    m_ESPs[iter->second].m_Enabled = enable;
+    m_ESPs[iter->second].m_Enabled =
+        enable | m_ESPs[iter->second].m_ForceEnabled;
 
     emit writePluginsList();
   } else {
@@ -239,8 +238,8 @@ void PluginList::enableAll()
 {
   if (QMessageBox::question(nullptr, tr("Confirm"), tr("Really enable all plugins?"),
                             QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-    for (std::vector<ESPInfo>::iterator iter = m_ESPs.begin(); iter != m_ESPs.end(); ++iter) {
-      iter->m_Enabled = true;
+    for (ESPInfo &info : m_ESPs) {
+      info.m_Enabled = true;
     }
     emit writePluginsList();
   }
@@ -251,9 +250,9 @@ void PluginList::disableAll()
 {
   if (QMessageBox::question(nullptr, tr("Confirm"), tr("Really disable all plugins?"),
                             QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-    for (std::vector<ESPInfo>::iterator iter = m_ESPs.begin(); iter != m_ESPs.end(); ++iter) {
-      if (!iter->m_ForceEnabled) {
-        iter->m_Enabled = false;
+    for (ESPInfo &info : m_ESPs) {
+      if (!info.m_ForceEnabled) {
+        info.m_Enabled = false;
       }
     }
     emit writePluginsList();
@@ -302,89 +301,6 @@ bool PluginList::isEnabled(int index)
   return m_ESPs.at(index).m_Enabled;
 }
 
-bool PluginList::readLoadOrder(const QString &fileName)
-{
-  std::set<QString> availableESPs;
-  for (std::vector<ESPInfo>::const_iterator iter = m_ESPs.begin(); iter != m_ESPs.end(); ++iter) {
-    availableESPs.insert(iter->m_Name.toLower());
-  }
-
-  m_ESPLoadOrder.clear();
-
-  int priority = 0;
-
-  QStringList primaryPlugins = m_GamePlugin->primaryPlugins();
-  for (const QString &plugin : primaryPlugins) {
-    if (availableESPs.find(plugin) != availableESPs.end()) {
-      m_ESPLoadOrder[plugin] = priority++;
-    }
-  }
-
-  QFile file(fileName);
-  if (!file.open(QIODevice::ReadOnly)) {
-    return false;
-  }
-  if (file.size() == 0) {
-    // MO stores at least a header in the file. if it's completely empty the file is broken
-    return false;
-  }
-  while (!file.atEnd()) {
-    QByteArray line = file.readLine().trimmed();
-    QString modName;
-    if ((line.size() > 0) && (line.at(0) != '#')) {
-      modName = QString::fromUtf8(line.constData()).toLower();
-    }
-
-    if ((modName.size() > 0) &&
-        (m_ESPLoadOrder.find(modName) == m_ESPLoadOrder.end()) &&
-        (availableESPs.find(modName) != availableESPs.end())) {
-      m_ESPLoadOrder[modName] = priority++;
-    }
-  }
-
-  file.close();
-  return true;
-}
-
-
-void PluginList::readEnabledFrom(const QString &fileName)
-{
-  for (std::vector<ESPInfo>::iterator iter = m_ESPs.begin(); iter != m_ESPs.end(); ++iter) {
-    if (!iter->m_ForceEnabled) {
-      iter->m_Enabled = false;
-    }
-    iter->m_LoadOrder = -1;
-  }
-
-  QFile file(fileName);
-  if (!file.exists()) {
-    throw std::runtime_error(QObject::tr("failed to find \"%1\"").arg(fileName).toUtf8().constData());
-  }
-
-  file.open(QIODevice::ReadOnly);
-  while (!file.atEnd()) {
-    QByteArray line = file.readLine();
-    QString modName;
-    if ((line.size() > 0) && (line.at(0) != '#')) {
-      modName = m_LocalCodec->toUnicode(line.trimmed().constData());
-    }
-    if (modName.size() > 0) {
-      std::map<QString, int>::iterator iter = m_ESPsByName.find(modName.toLower());
-      if (iter != m_ESPsByName.end()) {
-        m_ESPs[iter->second].m_Enabled = true;
-      } else {
-        qWarning("plugin %s not found", modName.toUtf8().constData());
-        emit writePluginsList();
-      }
-    }
-  }
-
-  file.close();
-
-  testMasters();
-}
-
-
 void PluginList::readLockedOrderFrom(const QString &fileName)
 {
   m_LockedOrder.clear();
@@ -411,53 +327,6 @@ void PluginList::readLockedOrderFrom(const QString &fileName)
   file.close();
 }
 
-
-
-void PluginList::writePlugins(const QString &fileName, bool writeUnchecked) const
-{
-  SafeWriteFile file(fileName);
-
-  QTextCodec *textCodec = writeUnchecked ? m_Utf8Codec : m_LocalCodec;
-
-  file->resize(0);
-
-  file->write(textCodec->fromUnicode("# This file was automatically generated by Mod Organizer.\r\n"));
-
-  QStringList saveList;
-
-  bool invalidFileNames = false;
-  int writtenCount = 0;
-  for (size_t i = 0; i < m_ESPs.size(); ++i) {
-    int priority = m_ESPsByPriority[i];
-    if (m_ESPs[priority].m_Enabled || writeUnchecked) {
-      //file.write(m_ESPs[priority].m_Name.toUtf8());
-      if (!textCodec->canEncode(m_ESPs[priority].m_Name)) {
-        invalidFileNames = true;
-        qCritical("invalid plugin name %s", m_ESPs[priority].m_Name.toUtf8().constData());
-      } else {
-        saveList << m_ESPs[priority].m_Name;
-        file->write(textCodec->fromUnicode(m_ESPs[priority].m_Name));
-      }
-      file->write("\r\n");
-      ++writtenCount;
-    }
-  }
-
-  if (invalidFileNames) {
-    reportError(tr("Some of your plugins have invalid names! These plugins can not be loaded by the game. "
-                   "Please see mo_interface.log for a list of affected plugins and rename them."));
-  }
-
-  if (writtenCount == 0) {
-    qWarning("plugin list would be empty, this is almost certainly wrong. Not saving.");
-  } else {
-    if (file.commitIfDifferent(m_LastSaveHash[fileName])) {
-      qDebug("%s saved", QDir::toNativeSeparators(fileName).toUtf8().constData());
-    }
-  }
-}
-
-
 void PluginList::writeLockedOrder(const QString &fileName) const
 {
   SafeWriteFile file(fileName);
@@ -472,14 +341,13 @@ void PluginList::writeLockedOrder(const QString &fileName) const
 }
 
 
-void PluginList::saveTo(const QString &pluginFileName
-                        , const QString &loadOrderFileName
-                        , const QString &lockedOrderFileName
+void PluginList::saveTo(const QString &lockedOrderFileName
                         , const QString& deleterFileName
                         , bool hideUnchecked) const
 {
-  writePlugins(pluginFileName, false);
-  writePlugins(loadOrderFileName, true);
+  GamePlugins *gamePlugins = m_GamePlugin->feature<GamePlugins>();
+  gamePlugins->writePluginLists(this);
+
   writeLockedOrder(lockedOrderFileName);
 
   if (hideUnchecked) {
@@ -553,7 +421,7 @@ bool PluginList::saveLoadOrder(DirectoryEntry &directoryStructure)
 int PluginList::enabledCount() const
 {
   int enabled = 0;
-  foreach (auto info, m_ESPs) {
+  for (const auto &info : m_ESPs) {
     if (info.m_Enabled) {
       ++enabled;
     }
@@ -607,7 +475,7 @@ void PluginList::refreshLoadOrder()
   bool savePluginsList = false;
   // this is guaranteed to iterate from lowest key (load order) to highest
   for (auto iter = lockedLoadOrder.begin(); iter != lockedLoadOrder.end(); ++iter) {
-    auto nameIter = m_ESPsByName.find(iter->second);
+    auto nameIter = m_ESPsByName.find(iter->second.toLower());
     if (nameIter != m_ESPsByName.end()) {
       // locked esp exists
 
@@ -642,6 +510,17 @@ void PluginList::disconnectSlots() {
   m_PluginStateChanged.disconnect_all_slots();
 }
 
+QStringList PluginList::pluginNames() const
+{
+  QStringList result;
+
+  for (const ESPInfo &info : m_ESPs) {
+    result.append(info.m_Name);
+  }
+
+  return result;
+}
+
 IPluginList::PluginStates PluginList::state(const QString &name) const
 {
   auto iter = m_ESPsByName.find(name.toLower());
@@ -650,6 +529,38 @@ IPluginList::PluginStates PluginList::state(const QString &name) const
   } else {
     return m_ESPs[iter->second].m_Enabled ? IPluginList::STATE_ACTIVE : IPluginList::STATE_INACTIVE;
   }
+}
+
+void PluginList::setState(const QString &name, PluginStates state) {
+  auto iter = m_ESPsByName.find(name.toLower());
+  if (iter != m_ESPsByName.end()) {
+    m_ESPs[iter->second].m_Enabled = (state == IPluginList::STATE_ACTIVE) ||
+                                     m_ESPs[iter->second].m_ForceEnabled;
+  } else {
+    qWarning("plugin %s not found", qPrintable(name));
+  }
+}
+
+void PluginList::setLoadOrder(const QStringList &pluginList)
+{
+  for (ESPInfo &info : m_ESPs) {
+    info.m_Priority = -1;
+  }
+  int maxPriority = 0;
+  for (const QString &plugin : pluginList) {
+    auto iter = m_ESPsByName.find(plugin.toLower());
+    if (iter !=m_ESPsByName.end()) {
+      m_ESPs[iter->second].m_Priority = maxPriority++;
+    }
+  }
+
+  // use old priorities
+  for (ESPInfo &info : m_ESPs) {
+    if (info.m_Priority == -1) {
+      info.m_Priority = maxPriority++;
+    }
+  }
+  updateIndices();
 }
 
 int PluginList::priority(const QString &name) const
@@ -689,7 +600,7 @@ QStringList PluginList::masters(const QString &name) const
     return QStringList();
   } else {
     QStringList result;
-    foreach (const QString &master, m_ESPs[iter->second].m_Masters) {
+    for (const QString &master : m_ESPs[iter->second].m_Masters) {
       result.append(master);
     }
     return result;
@@ -731,10 +642,16 @@ void PluginList::updateIndices()
   m_ESPsByName.clear();
   m_ESPsByPriority.clear();
   m_ESPsByPriority.resize(m_ESPs.size());
-
   for (unsigned int i = 0; i < m_ESPs.size(); ++i) {
+    if (m_ESPs[i].m_Priority < 0) {
+      continue;
+    }
+    if (m_ESPs[i].m_Priority >= static_cast<int>(m_ESPs.size())) {
+      qCritical("invalid priority %d", m_ESPs[i].m_Priority);
+      continue;
+    }
     m_ESPsByName[m_ESPs[i].m_Name.toLower()] = i;
-    m_ESPsByPriority[m_ESPs[i].m_Priority] = i;
+    m_ESPsByPriority.at(static_cast<size_t>(m_ESPs[i].m_Priority)) = i;
   }
 }
 
@@ -742,7 +659,7 @@ void PluginList::updateIndices()
 int PluginList::rowCount(const QModelIndex &parent) const
 {
   if (!parent.isValid()) {
-    return m_ESPs.size();
+    return static_cast<int>(m_ESPs.size());
   } else {
     return 0;
   }
@@ -819,8 +736,6 @@ QVariant PluginList::data(const QModelIndex &modelIndex, int role) const
     if (m_ESPs[index].m_IsMaster) {
       result.setItalic(true);
       result.setWeight(QFont::Bold);
-    } else if (m_ESPs[index].m_IsDummy) {
-      result.setItalic(true);
     }
     return result;
   } else if (role == Qt::TextAlignmentRole) {
@@ -861,9 +776,6 @@ QVariant PluginList::data(const QModelIndex &modelIndex, int role) const
       if (m_ESPs[index].m_HasIni) {
         text += "<br>There is an ini file connected to this esp. Its settings will be added to your game settings, overwriting "
                 "in case of conflicts.";
-      } else if (m_ESPs[index].m_IsDummy) {
-        text += "<br>This file is a dummy! It exists only so the bsa with the same name gets loaded. If you let MO manage archives you "
-                "don't need this: Enable the archive with the same name in the \"Archive\" tab and disable this plugin.";
       }
       toolTip += text;
     }
@@ -886,9 +798,6 @@ QVariant PluginList::data(const QModelIndex &modelIndex, int role) const
     if (m_ESPs[index].m_HasIni) {
       result.append(":/MO/gui/attachment");
     }
-    if (m_ESPs[index].m_IsDummy && m_ESPs[index].m_Enabled && !m_ESPs[index].m_HasIni) {
-      result.append(":/MO/gui/edit_clear");
-    }
     return result;
   }
   return QVariant();
@@ -903,7 +812,8 @@ bool PluginList::setData(const QModelIndex &modIndex, const QVariant &value, int
   bool result = false;
 
   if (role == Qt::CheckStateRole) {
-    m_ESPs[modIndex.row()].m_Enabled = value.toInt() == Qt::Checked;
+    m_ESPs[modIndex.row()].m_Enabled =
+        value.toInt() == Qt::Checked || m_ESPs[modIndex.row()].m_ForceEnabled;
     emit dataChanged(modIndex, modIndex);
 
     refreshLoadOrder();
@@ -927,7 +837,9 @@ bool PluginList::setData(const QModelIndex &modIndex, const QVariant &value, int
     try {
       m_PluginStateChanged(modName, newState);
       testMasters();
-      emit dataChanged(this->index(0, 0), this->index(m_ESPs.size(), columnCount()));
+      emit dataChanged(
+          this->index(0, 0),
+          this->index(static_cast<int>(m_ESPs.size()), columnCount()));
     } catch (const std::exception &e) {
       qCritical("failed to invoke state changed notification: %s", e.what());
     } catch (...) {
@@ -1003,8 +915,10 @@ void PluginList::setPluginPriority(int row, int &newPriority)
   }
 
   // enforce valid range
-  if (newPriorityTemp < 0) newPriorityTemp = 0;
-  else if (newPriorityTemp >= static_cast<int>(m_ESPsByPriority.size())) newPriorityTemp = m_ESPsByPriority.size() - 1;
+  if (newPriorityTemp < 0)
+    newPriorityTemp = 0;
+  else if (newPriorityTemp >= static_cast<int>(m_ESPsByPriority.size()))
+    newPriorityTemp = static_cast<int>(m_ESPsByPriority.size()) - 1;
 
   try {
     int oldPriority = m_ESPs.at(row).m_Priority;
@@ -1086,11 +1000,11 @@ bool PluginList::dropMimeData(const QMimeData *mimeData, Qt::DropAction action, 
     row = parent.row();
   }
 
-  int newPriority = 0;
+  int newPriority;
 
   if ((row < 0) ||
       (row >= static_cast<int>(m_ESPs.size()))) {
-    newPriority = m_ESPs.size();
+    newPriority = static_cast<int>(m_ESPs.size());
   } else {
     newPriority = m_ESPs[row].m_Priority;
   }
@@ -1197,7 +1111,6 @@ PluginList::ESPInfo::ESPInfo(const QString &name, bool enabled,
   try {
     ESP::File file(ToWString(fullPath));
     m_IsMaster = file.isMaster();
-    m_IsDummy = file.isDummy();
     m_Author = QString::fromLatin1(file.author().c_str());
     m_Description = QString::fromLatin1(file.description().c_str());
     std::set<std::string> masters = file.masters();
@@ -1207,11 +1120,10 @@ PluginList::ESPInfo::ESPInfo(const QString &name, bool enabled,
   } catch (const std::exception &e) {
     qCritical("failed to parse esp file %s: %s", qPrintable(fullPath), e.what());
     m_IsMaster = false;
-    m_IsDummy = false;
   }
 }
 
-void PluginList::managedGameChanged(IPluginGame const *gamePlugin)
+void PluginList::managedGameChanged(const IPluginGame *gamePlugin)
 {
   m_GamePlugin = gamePlugin;
 }
